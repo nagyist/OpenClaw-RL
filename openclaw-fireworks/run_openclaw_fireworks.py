@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Entry point for OpenClaw-RL with Firetitan backend.
+"""Entry point for OpenClaw-RL with Fireworks backend.
 
 Bootstraps:
   1. Fireworks Deployment (policy inference + PRM)
-  2. Firetitan Trainer (training + teacher logprobs)
+  2. Fireworks Trainer (training + teacher logprobs)
   3. OpenClaw API server (proxy)
   4. Training loop (drain queue -> train -> weight sync)
 
@@ -49,7 +49,7 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     stream=sys.stdout,
 )
-logger = logging.getLogger("openclaw-firetitan")
+logger = logging.getLogger("openclaw-fireworks")
 
 
 def main():
@@ -89,14 +89,14 @@ def main():
     from fireworks.training.sdk import (
         DeploymentConfig,
         DeploymentManager,
-        FiretitanServiceClient,
+        FireworksServiceClient,
         TrainerJobConfig,
         TrainerJobManager,
         WeightSyncer,
     )
 
     logger.info("=" * 70)
-    logger.info("  OpenClaw-RL Firetitan Backend")
+    logger.info("  OpenClaw-RL Fireworks Backend")
     logger.info("  base_model:    %s", base_model)
     logger.info("  shape_id:      %s", shape_id)
     logger.info("  deployment_id: %s", deployment_id)
@@ -144,7 +144,7 @@ def main():
     logger.info("[Bootstrap] Trainer ready at %s", endpoint.base_url)
 
     # ----- 4. Connect training client -----
-    service = FiretitanServiceClient(base_url=endpoint.base_url, api_key=api_key)
+    service = FireworksServiceClient(base_url=endpoint.base_url, api_key=api_key)
     training_client = service.create_training_client(
         base_model=base_model, lora_rank=lora_rank,
     )
@@ -169,13 +169,13 @@ def main():
     deployment_model = f"accounts/{account_id}/deployments/{deployment_id}"
 
     # ----- 7. Start API server -----
-    from firetitan_server import OpenClawFiretitanServer
+    from fireworks_server import OpenClawFireworksServer
 
     output_queue: queue.Queue = queue.Queue(maxsize=100000)
     submission_enabled = threading.Event()
     submission_enabled.set()
 
-    server = OpenClawFiretitanServer(
+    server = OpenClawFireworksServer(
         output_queue=output_queue,
         submission_enabled=submission_enabled,
         tokenizer_model=tokenizer_model,
@@ -197,7 +197,7 @@ def main():
     logger.info("[Bootstrap] API server started on port %d", server_port)
 
     # ----- 8. Run training loop (blocks) -----
-    from firetitan_training_loop import run_training_loop
+    from fireworks_training_loop import run_training_loop
 
     try:
         run_training_loop(

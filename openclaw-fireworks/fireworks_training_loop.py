@@ -1,10 +1,10 @@
-"""Firetitan training loop for OpenClaw-RL.
+"""Fireworks training loop for OpenClaw-RL.
 
 Replaces the Ray + RolloutManager + MegatronTrainRayActor pipeline with a
 simple Python loop that:
   1. Drains training samples from the API server's output queue
   2. Builds tinker Datums
-  3. Drives forward_backward_custom + optim_step on the remote Firetitan trainer
+  3. Drives forward_backward_custom + optim_step on the remote Fireworks trainer
   4. Periodically syncs weights to the Fireworks deployment
 """
 
@@ -19,8 +19,8 @@ import tinker
 import torch
 from fireworks.training.sdk import GradAccNormalization
 
-from firetitan_loss import build_datum, make_combine_loss_fn
-from firetitan_server import TrainingSample
+from fireworks_loss import build_datum, make_combine_loss_fn
+from fireworks_server import TrainingSample
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ def run_training_loop(
     """Main training loop: drain -> train -> weight-sync -> repeat.
 
     Args:
-        training_client: FiretitanTrainingClient instance.
+        training_client: FireworksTrainingClient instance.
         weight_syncer: WeightSyncer instance for checkpoint + hotload.
         output_queue: Queue receiving (group_id, [TrainingSample]) tuples.
         batch_size: Number of samples per training step.

@@ -1,13 +1,13 @@
-"""OpenClaw Firetitan API server.
+"""OpenClaw Fireworks API server.
 
 Replaces the SGLang-backed OPD/Combine server with a Fireworks Deployment
-for policy inference and PRM text generation, and uses the Firetitan policy
+for policy inference and PRM text generation, and uses the Fireworks policy
 trainer for teacher log-prob computation.
 
 This server acts as an OpenAI-compatible proxy:
   - Client -> POST /v1/chat/completions -> Fireworks Deployment (policy)
   - PRM hint/eval judges -> same Fireworks Deployment (chat completions)
-  - Teacher logprobs -> Firetitan trainer forward() pass
+  - Teacher logprobs -> Fireworks trainer forward() pass
   - Training samples -> output_queue -> training loop
 """
 
@@ -49,7 +49,7 @@ _NON_STANDARD_BODY_KEYS = {"session_id", "session_done", "turn_type"}
 
 @dataclass
 class TrainingSample:
-    """Lightweight sample for the Firetitan training loop (no slime dependency)."""
+    """Lightweight sample for the Fireworks training loop (no slime dependency)."""
 
     tokens: list[int] = field(default_factory=list)
     prompt_len: int = 0
@@ -245,10 +245,10 @@ def _is_valid_rl_score(score) -> bool:
     return score in (1, -1, 1.0, -1.0)
 
 
-class OpenClawFiretitanServer:
+class OpenClawFireworksServer:
     """Async proxy that collects training data from user interactions.
 
-    Uses Fireworks Deployment for inference and PRM, and a Firetitan trainer
+    Uses Fireworks Deployment for inference and PRM, and a Fireworks trainer
     for teacher log-prob computation via forward() passes.
     """
 
@@ -321,7 +321,7 @@ class OpenClawFiretitanServer:
         self.training_client = training_client
 
     def _build_app(self) -> FastAPI:
-        app = FastAPI(title="OpenClaw Firetitan Proxy")
+        app = FastAPI(title="OpenClaw Fireworks Proxy")
         app.state.owner = self
 
         @app.get("/healthz")
@@ -336,7 +336,7 @@ class OpenClawFiretitanServer:
             x_turn_type: str | None = Header(default=None),
             x_session_done: str | None = Header(default=None),
         ):
-            owner: OpenClawFiretitanServer = request.app.state.owner
+            owner: OpenClawFireworksServer = request.app.state.owner
             await owner._check_auth(authorization)
             if not owner.submission_enabled.is_set():
                 raise HTTPException(status_code=503, detail="submission paused for weight update")
@@ -400,13 +400,13 @@ class OpenClawFiretitanServer:
                         max_attempts = hotload_max_retries
                         cur_backoff = hotload_backoff
                         logger.info(
-                            "[Firetitan] Deployment is hot-loading, extending retries "
+                            "[Fireworks] Deployment is hot-loading, extending retries "
                             "to %d (attempt %d)",
                             hotload_max_retries, attempt + 1,
                         )
                     else:
                         logger.warning(
-                            "[Firetitan] Deployment returned %d (attempt %d/%d): %s",
+                            "[Fireworks] Deployment returned %d (attempt %d/%d): %s",
                             resp.status_code, attempt + 1, max_attempts, resp.text[:500],
                         )
                     last_exc = httpx.HTTPStatusError(
@@ -414,7 +414,7 @@ class OpenClawFiretitanServer:
                     )
             except Exception as e:
                 logger.warning(
-                    "[Firetitan] Deployment request failed (attempt %d/%d): %s",
+                    "[Fireworks] Deployment request failed (attempt %d/%d): %s",
                     attempt + 1, max_attempts, e,
                 )
                 last_exc = e
@@ -441,7 +441,7 @@ class OpenClawFiretitanServer:
             score, hint = _parse_judge_result(raw)
             return {"vote_id": vote_id, "score": score, "hint": hint, "raw": raw}
         except Exception as e:
-            logger.warning("[Firetitan] judge query failed (vote %d): %s", vote_id, e)
+            logger.warning("[Fireworks] judge query failed (vote %d): %s", vote_id, e)
             return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
 
     async def _query_prm_eval_once(self, eval_messages: list[dict], vote_id: int) -> int | None:
@@ -457,17 +457,17 @@ class OpenClawFiretitanServer:
             raw = output.get("choices", [{}])[0].get("message", {}).get("content", "")
             return _parse_prm_eval_score(raw)
         except Exception as e:
-            logger.warning("[Firetitan] PRM eval query failed (vote %d): %s", vote_id, e)
+            logger.warning("[Fireworks] PRM eval query failed (vote %d): %s", vote_id, e)
             return None
 
     # ------------------------------------------------------------------
-    # Teacher log-probs via Firetitan trainer forward() pass
+    # Teacher log-probs via Fireworks trainer forward() pass
     # ------------------------------------------------------------------
 
     async def _compute_teacher_log_probs(
         self, input_ids: list[int], response_len: int,
     ) -> list[float]:
-        """Compute teacher log-probs using the Firetitan policy trainer.
+        """Compute teacher log-probs using the Fireworks policy trainer.
 
         Builds a datum from the hint-augmented full sequence and runs a
         forward-only pass to get per-token log-probs.
@@ -476,7 +476,7 @@ class OpenClawFiretitanServer:
             return [0.0] * response_len
 
         import tinker
-        from firetitan_loss import build_datum
+        from fireworks_loss import build_datum
 
         prompt_len = max(0, len(input_ids) - response_len)
         datum = build_datum(input_ids, prompt_len)
@@ -493,7 +493,7 @@ class OpenClawFiretitanServer:
                 return all_lp[-response_len:]
             return [0.0] * (response_len - len(all_lp)) + all_lp
         except Exception as e:
-            logger.warning("[Firetitan] teacher logprob forward failed: %s", e)
+            logger.warning("[Fireworks] teacher logprob forward failed: %s", e)
             return [0.0] * response_len
 
     # ------------------------------------------------------------------
@@ -527,7 +527,7 @@ class OpenClawFiretitanServer:
             )
             eval_score = _prm_eval_majority_vote(eval_raw)
             logger.info(
-                "%s[Firetitan] PRM eval session=%s turn=%d eval_votes=%s -> eval_score=%.1f%s",
+                "%s[Fireworks] PRM eval session=%s turn=%d eval_votes=%s -> eval_score=%.1f%s",
                 _CYAN, session_id, turn_num,
                 [s if s is not None else "fail" for s in eval_raw],
                 eval_score, _RESET,
@@ -538,7 +538,7 @@ class OpenClawFiretitanServer:
 
         if selected is None:
             logger.info(
-                "%s[Firetitan] session=%s turn=%d no valid hint (votes=%s)%s",
+                "%s[Fireworks] session=%s turn=%d no valid hint (votes=%s)%s",
                 _CYAN, session_id, turn_num, votes_display, _RESET,
             )
             self._append_prm_record({
@@ -565,7 +565,7 @@ class OpenClawFiretitanServer:
         teacher_log_probs = await self._compute_teacher_log_probs(enhanced_ids, response_len)
 
         logger.info(
-            "%s[Firetitan] session=%s turn=%d accepted hint_len=%d votes=%s%s",
+            "%s[Fireworks] session=%s turn=%d accepted hint_len=%d votes=%s%s",
             _CYAN, session_id, turn_num, len(hint), votes_display, _RESET,
         )
         self._append_prm_record({
@@ -613,7 +613,7 @@ class OpenClawFiretitanServer:
 
         tag = "OPD+RL" if reward != 0.0 else "OPD"
         logger.info(
-            "[Firetitan] submitted %s sample session=%s index=%d "
+            "[Fireworks] submitted %s sample session=%s index=%d "
             "reward=%.1f prompt_len=%d response_len=%d hint_len=%d",
             tag, session_id, sample.index, reward,
             len(prompt_ids), len(response_ids),
@@ -646,7 +646,7 @@ class OpenClawFiretitanServer:
             response_text=turn_data["response_text"],
         )
         logger.info(
-            "[Firetitan] submitted RL sample session=%s index=%d "
+            "[Fireworks] submitted RL sample session=%s index=%d "
             "score=%.1f prompt_len=%d response_len=%d",
             session_id, sample.index, float(eval_score),
             len(prompt_ids), len(response_ids),
@@ -672,7 +672,7 @@ class OpenClawFiretitanServer:
                     if self._eval_mode:
                         with self._eval_scores_lock:
                             self._eval_scores.append(0.0)
-                    logger.info("[Firetitan] dropped session=%s turn=%d (no next_state)", session_id, turn_num)
+                    logger.info("[Fireworks] dropped session=%s turn=%d (no next_state)", session_id, turn_num)
                 continue
             if not task.done():
                 continue
@@ -682,7 +682,7 @@ class OpenClawFiretitanServer:
             try:
                 opd_result = task.result()
             except Exception as e:
-                logger.warning("[Firetitan] evaluation failed session=%s turn=%d: %s", session_id, turn_num, e)
+                logger.warning("[Fireworks] evaluation failed session=%s turn=%d: %s", session_id, turn_num, e)
                 if self._eval_mode:
                     with self._eval_scores_lock:
                         self._eval_scores.append(0.0)
@@ -740,11 +740,11 @@ class OpenClawFiretitanServer:
         content = assistant_msg.get("content") or ""
         reasoning = assistant_msg.get("reasoning_content") or ""
         logger.info(
-            "%s[Firetitan] [%s] session=%s prompt_msgs=%d%s",
+            "%s[Fireworks] [%s] session=%s prompt_msgs=%d%s",
             _YELLOW, turn_type, session_id, len(messages), _RESET,
         )
         logger.info(
-            "%s[Firetitan] [%s] session=%s thinking=%d chars, response:\n%s%s",
+            "%s[Fireworks] [%s] session=%s thinking=%d chars, response:\n%s%s",
             _RED, turn_type, session_id, len(reasoning), content, _RESET,
         )
 
@@ -774,7 +774,7 @@ class OpenClawFiretitanServer:
             response_ids = self.tokenizer(response_text, add_special_tokens=False)["input_ids"]
 
             if not response_ids and not response_text.strip():
-                logger.info("[Firetitan] MAIN session=%s -> empty response, skipping", session_id)
+                logger.info("[Fireworks] MAIN session=%s -> empty response, skipping", session_id)
                 output["session_id"] = session_id
                 return {"response": output}
 
@@ -799,18 +799,18 @@ class OpenClawFiretitanServer:
             self._pending_turn_data.setdefault(session_id, {})[turn_num] = turn_data
             self._buffer_record(session_id, turn_num, messages, prompt_text, response_text, tool_calls)
             logger.info(
-                "[Firetitan] MAIN session=%s turn=%d prompt_tokens=%d response_tokens=%d",
+                "[Fireworks] MAIN session=%s turn=%d prompt_tokens=%d response_tokens=%d",
                 session_id, turn_num, len(prompt_ids), len(response_ids),
             )
             self._maybe_submit_ready_samples(session_id)
         else:
-            logger.info("[Firetitan] SIDE session=%s -> skipped (no training data)", session_id)
+            logger.info("[Fireworks] SIDE session=%s -> skipped (no training data)", session_id)
 
         if session_done:
             self._flush_pending_record(session_id, None)
             self._maybe_submit_ready_samples(session_id, force_drop_without_next_state=True)
             self._turn_counts.pop(session_id, None)
-            logger.info("[Firetitan] session=%s done -> cleaned up", session_id)
+            logger.info("[Fireworks] session=%s done -> cleaned up", session_id)
 
         output["session_id"] = session_id
         return {"response": output}
@@ -851,7 +851,7 @@ class OpenClawFiretitanServer:
                 with open(self._record_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             except OSError as e:
-                logger.warning("[Firetitan] failed to write record: %s", e)
+                logger.warning("[Fireworks] failed to write record: %s", e)
 
     def _append_prm_record(self, record):
         if not self._prm_record_file:
@@ -860,7 +860,7 @@ class OpenClawFiretitanServer:
             with open(self._prm_record_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as e:
-            logger.warning("[Firetitan] failed to write PRM record: %s", e)
+            logger.warning("[Fireworks] failed to write PRM record: %s", e)
 
     def drain_eval_scores(self) -> list[float]:
         with self._eval_scores_lock:
@@ -891,7 +891,7 @@ class OpenClawFiretitanServer:
             return
         exc = task.exception()
         if exc is not None:
-            logger.error("[Firetitan] background task failed: %s", exc, exc_info=exc)
+            logger.error("[Fireworks] background task failed: %s", exc, exc_info=exc)
 
     async def _stream_response(self, result: dict[str, Any]):
         payload = result["response"]
@@ -940,7 +940,7 @@ class OpenClawFiretitanServer:
                 time.sleep(3)
             banner = (
                 f"\n{'=' * 70}\n"
-                f"  [Firetitan] OpenClaw proxy ready\n"
+                f"  [Fireworks] OpenClaw proxy ready\n"
                 f"  proxy {self.host}:{self.port} -> {self.deployment_chat_url}\n"
                 f"  PRM enabled: {self._prm_enabled} (m={self._prm_m})\n"
                 f"{'=' * 70}\n"

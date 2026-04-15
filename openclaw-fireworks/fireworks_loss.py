@@ -1,6 +1,6 @@
-"""Combined RL (GRPO) + OPD (distillation) loss for Firetitan Training SDK.
+"""Combined RL (GRPO) + OPD (distillation) loss for Fireworks Training SDK.
 
-Adapts openclaw-combine/combine_loss.py to work with Firetitan's
+Adapts openclaw-combine/combine_loss.py to work with Fireworks's
 forward_backward_custom signature: (data, logprobs_list) -> (loss, metrics).
 
 Both branches use the same PPO-style clipped policy gradient objective,
@@ -31,7 +31,7 @@ def make_combine_loss_fn(
     eps_clip: float = 0.2,
     eps_clip_high: float = 0.28,
 ):
-    """Build a Firetitan-compatible loss function with pre-computed advantages.
+    """Build a Fireworks-compatible loss function with pre-computed advantages.
 
     Args:
         old_logprobs: Per-token rollout log-probs for each sample (response
