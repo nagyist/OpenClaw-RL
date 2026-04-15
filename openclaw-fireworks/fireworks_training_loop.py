@@ -159,7 +159,7 @@ def run_training_loop(
     """Main training loop: drain -> train -> weight-sync -> repeat.
 
     Args:
-        training_client: FireworksTrainingClient instance.
+        training_client: FiretitanTrainingClient instance.
         weight_syncer: WeightSyncer instance for checkpoint + hotload.
         output_queue: Queue receiving (group_id, [TrainingSample]) tuples.
         batch_size: Number of samples per training step.

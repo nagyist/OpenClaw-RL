@@ -89,7 +89,7 @@ def main():
     from fireworks.training.sdk import (
         DeploymentConfig,
         DeploymentManager,
-        FireworksServiceClient,
+        FiretitanServiceClient,
         TrainerJobConfig,
         TrainerJobManager,
         WeightSyncer,
@@ -144,7 +144,7 @@ def main():
     logger.info("[Bootstrap] Trainer ready at %s", endpoint.base_url)
 
     # ----- 4. Connect training client -----
-    service = FireworksServiceClient(base_url=endpoint.base_url, api_key=api_key)
+    service = FiretitanServiceClient(base_url=endpoint.base_url, api_key=api_key)
     training_client = service.create_training_client(
         base_model=base_model, lora_rank=lora_rank,
     )
