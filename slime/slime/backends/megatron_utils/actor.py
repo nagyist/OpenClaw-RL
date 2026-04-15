@@ -1,3 +1,5 @@
+import copy
+import inspect
 import logging
 import os
 import random
@@ -72,6 +74,20 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> int | None:
         monkey_patch_torch_dist()
 
+        if role == "prm_teacher":
+            args = copy.deepcopy(args)
+            args.tensor_model_parallel_size = getattr(args, "prm_teacher_num_gpus", 1)
+            args.pipeline_model_parallel_size = 1
+            args.context_parallel_size = 1
+            args.sequence_parallel = False
+            args.expert_model_parallel_size = 1
+            args.expert_tensor_parallel_size = 1
+            args.hf_checkpoint = args.prm_teacher_load
+            args.pretrained_checkpoint = args.prm_teacher_load
+            args.load = args.prm_teacher_load
+            args.no_load_optim = True
+            args.no_load_rng = True
+
         super().init(args, role, with_ref)
 
         init(args)
@@ -114,6 +130,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if role == "critic":
             if self.args.offload_train:
                 self.sleep()
+            return
+
+        if role == "prm_teacher":
+            clear_memory()
             return
 
         start_rollout_id = loaded_rollout_id + 1
@@ -210,6 +230,10 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data["tokens"] = [
             torch.tensor(t, dtype=torch.long) for t in rollout_data["tokens"]
         ]
+        if "teacher_tokens" in rollout_data:
+            rollout_data["teacher_tokens"] = [
+                torch.tensor(t, dtype=torch.long) for t in rollout_data["teacher_tokens"]
+            ]
         rollout_data["loss_masks"] = [
             torch.tensor(t, dtype=torch.int) for t in rollout_data["loss_masks"]
         ]
@@ -399,6 +423,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
+    def set_prm_teacher_log_probs(self, prm_teacher_log_probs):
+        """Receive PRM teacher log-probs from a separate PRM teacher actor group."""
+        self._prm_teacher_log_probs = prm_teacher_log_probs
+
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.offload_train:
             self.wake_up()
@@ -411,8 +439,21 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.role == "critic":
             return self.train_critic(rollout_id, rollout_data)
+        elif self.role == "prm_teacher":
+            return self.compute_prm_teacher_log_probs(rollout_id, rollout_data)
         else:
             return self.train_actor(rollout_id, rollout_data)
+
+    def compute_prm_teacher_log_probs(self, rollout_id: int, rollout_data: RolloutBatch):
+        """Compute log-probs on the dedicated PRM teacher GPU using hint-enhanced tokens."""
+        teacher_tokens = rollout_data.get("teacher_tokens")
+        if teacher_tokens is not None:
+            rollout_data["tokens"] = teacher_tokens
+            rollout_data["total_lengths"] = rollout_data["teacher_total_lengths"]
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        result = self.compute_log_prob(data_iterator, num_microbatches, store_prefix="prm_teacher_")
+        log_probs = result["prm_teacher_log_probs"]
+        return [lp.cpu() if isinstance(lp, torch.Tensor) else lp for lp in log_probs]
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
@@ -466,6 +507,9 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
+                if hasattr(self, "_prm_teacher_log_probs") and self._prm_teacher_log_probs is not None:
+                    rollout_data["prm_teacher_log_probs"] = self._prm_teacher_log_probs
+                    self._prm_teacher_log_probs = None
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
@@ -504,7 +548,15 @@ class MegatronTrainRayActor(TrainRayActor):
             clear_memory()
 
             if self.rollout_data_postprocess is not None:
-                self.rollout_data_postprocess(self.args)
+                fn = self.rollout_data_postprocess
+                try:
+                    params = inspect.signature(fn).parameters
+                except (TypeError, ValueError):
+                    params = {}
+                if len(params) >= 2:
+                    fn(self.args, rollout_data)
+                else:
+                    fn(self.args)
 
             log_rollout_data(
                 rollout_id,

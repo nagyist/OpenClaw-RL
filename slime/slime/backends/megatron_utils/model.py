@@ -372,6 +372,7 @@ def train_one_step(
                 "rollout_log_probs",
                 "max_seq_lens",
                 "teacher_log_probs",
+                "prm_teacher_log_probs",
                 "teacher_topk_log_probs",
                 "teacher_topk_indices",
             ],

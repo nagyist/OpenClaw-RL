@@ -143,3 +143,8 @@ class RayTrainGroup:
 
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+
+    def set_prm_teacher_log_probs(self, prm_teacher_log_probs):
+        """Broadcast PRM teacher log-probs (computed on a separate GPU) to all actor ranks."""
+        prm_lps_ref = ray.put(prm_teacher_log_probs)
+        return ray.get([actor.set_prm_teacher_log_probs.remote(prm_lps_ref) for actor in self._actor_handlers])

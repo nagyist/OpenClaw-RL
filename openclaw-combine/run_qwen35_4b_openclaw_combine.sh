@@ -23,11 +23,24 @@ export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-/tmp}"
 NUM_GPUS=${NUM_GPUS:-8}
 ACTOR_GPUS=${ACTOR_GPUS:-4}
 ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
-PRM_GPUS=${PRM_GPUS:-2}
 
-if (( ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS > NUM_GPUS )); then
-    echo "ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS must be <= NUM_GPUS"
-    echo "ACTOR_GPUS=${ACTOR_GPUS}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, PRM_GPUS=${PRM_GPUS}, NUM_GPUS=${NUM_GPUS}"
+# OPD teacher source decides GPU layout for PRM:
+#   megatron  (default): 1 GPU PRM SGLang + 1 GPU Megatron teacher = "1+1"
+#   inference:           2 GPU PRM SGLang + 0 GPU Megatron teacher
+OPD_SRC="${OPENCLAW_COMBINE_OPD_TEACHER_SOURCE:-megatron}"
+if [ "${OPD_SRC}" = "inference" ]; then
+    PRM_GPUS=${PRM_GPUS:-2}
+    PRM_NUM_GPUS_PER_ENGINE=${PRM_NUM_GPUS_PER_ENGINE:-2}
+    PRM_TEACHER_GPUS=${PRM_TEACHER_GPUS:-0}
+else
+    PRM_GPUS=${PRM_GPUS:-1}
+    PRM_NUM_GPUS_PER_ENGINE=${PRM_NUM_GPUS_PER_ENGINE:-1}
+    PRM_TEACHER_GPUS=${PRM_TEACHER_GPUS:-1}
+fi
+
+if (( ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS + PRM_TEACHER_GPUS > NUM_GPUS )); then
+    echo "ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS + PRM_TEACHER_GPUS must be <= NUM_GPUS"
+    echo "ACTOR_GPUS=${ACTOR_GPUS}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, PRM_GPUS=${PRM_GPUS}, PRM_TEACHER_GPUS=${PRM_TEACHER_GPUS}, NUM_GPUS=${NUM_GPUS}"
     exit 1
 fi
 
@@ -45,6 +58,7 @@ HF_CKPT=${HF_CKPT:-/data_storage/wyj/systems/huggingface/hub/Qwen35-4B}
 REF_LOAD=${REF_LOAD:-${HF_CKPT}}
 SAVE_CKPT=${SAVE_CKPT:-${REPO_ROOT}/ckpt/qwen35-4b-openclaw-combine}
 PRM_MODEL_PATH=${PRM_MODEL_PATH:-/data_storage/wyj/systems/huggingface/hub/Qwen35-4B}
+PRM_TEACHER_LOAD=${PRM_TEACHER_LOAD:-${PRM_MODEL_PATH}}
 
 export SGLANG_API_KEY="${SGLANG_API_KEY}"
 export SERVED_MODEL_NAME="qwen3.5-4b"
@@ -65,6 +79,12 @@ export OPENCLAW_COMBINE_W_RL="${OPENCLAW_COMBINE_W_RL:-1.0}"
 export OPENCLAW_COMBINE_W_OPD="${OPENCLAW_COMBINE_W_OPD:-1.0}"
 export TRAIN_EPOCHS="${TRAIN_EPOCHS:-2}"
 
+# OPD teacher source (driven by OPD_SRC set above from GPU layout logic):
+#   megatron (default) = PRM teacher log-probs computed by Megatron via --prm-teacher-load.
+#                        Same code path as student, no numerical mismatch.
+#   inference          = teacher_log_probs from PRM SGLang inference engine.
+export OPENCLAW_COMBINE_OPD_TEACHER_SOURCE="${OPD_SRC}"
+
 CKPT_ARGS=(
    --megatron-to-hf-mode bridge
    --hf-checkpoint "${HF_CKPT}"
@@ -73,6 +93,12 @@ CKPT_ARGS=(
    --save-interval 100
    --rotary-base 10000000
 )
+if [ "${PRM_TEACHER_GPUS}" -gt 0 ]; then
+    CKPT_ARGS+=(
+        --prm-teacher-load "${PRM_TEACHER_LOAD}"
+        --prm-teacher-num-gpus "${PRM_TEACHER_GPUS}"
+    )
+fi
 
 ROLLOUT_ARGS=(
    --disable-rollout-global-dataset
@@ -148,7 +174,7 @@ fi
 PRM_ARGS=(
    --prm-enable
    --prm-num-gpus "${PRM_GPUS}"
-   --prm-num-gpus-per-engine 2
+   --prm-num-gpus-per-engine "${PRM_NUM_GPUS_PER_ENGINE}"
    --prm-model-path "${PRM_MODEL_PATH}"
    --prm-m "${PRM_M}"
    --prm-temperature "${PRM_TEMPERATURE:-0.6}"
@@ -197,6 +223,7 @@ RUNTIME_ENV_JSON="{
     \"OPENCLAW_COMBINE_W_RL\": \"${OPENCLAW_COMBINE_W_RL}\",
     \"OPENCLAW_COMBINE_W_OPD\": \"${OPENCLAW_COMBINE_W_OPD}\",
     \"SLIME_QWEN35_TEXT_ONLY_BRIDGE\": \"${SLIME_QWEN35_TEXT_ONLY_BRIDGE}\",
+    \"OPENCLAW_COMBINE_OPD_TEACHER_SOURCE\": \"${OPENCLAW_COMBINE_OPD_TEACHER_SOURCE}\",
     \"TRAIN_EPOCHS\": \"${TRAIN_EPOCHS}\"
   }
 }"

@@ -657,6 +657,7 @@ class OpenClawOPDAPIServer:
         result: dict[str, Any] = {
             "accepted": True,
             "teacher_log_probs": teacher_log_probs,
+            "teacher_tokens": enhanced_ids,
             "hint": hint,
             "votes": votes,
             "eval_score": eval_score,

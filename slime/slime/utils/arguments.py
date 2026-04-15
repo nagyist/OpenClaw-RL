@@ -764,6 +764,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--ref-ckpt-step", type=int, default=None, help="The checkpoint step for reference model. "
             )
+            parser.add_argument(
+                "--prm-teacher-load",
+                type=str,
+                default=None,
+                help=(
+                    "HF checkpoint for the PRM teacher model (OPD distillation). "
+                    "Loaded on a dedicated GPU group with TP=1 via bridge mode. "
+                    "Log-probs go through the same Megatron code path as the student. "
+                    "Independent of --ref-load."
+                ),
+            )
+            parser.add_argument(
+                "--prm-teacher-num-gpus",
+                type=int,
+                default=1,
+                help="Number of GPUs for the PRM teacher model (default 1, TP=1).",
+            )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)

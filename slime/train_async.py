@@ -18,8 +18,8 @@ def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"], pgs.get("prm"))
 
-    # create the actor and critic models
-    actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    # create the actor, critic, and (optionally) PRM teacher models
+    actor_model, critic_model, prm_teacher_model = create_training_models(args, pgs, rollout_manager)
 
     # always update weight first so that sglang has the loaded weights from training.
     actor_model.update_weights()
@@ -37,6 +37,11 @@ def train(args):
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+
+        if prm_teacher_model is not None:
+            prm_teacher_futures = prm_teacher_model.async_train(rollout_id, rollout_data_curr_ref)
+            prm_teacher_log_probs = ray.get(prm_teacher_futures[0])
+            actor_model.set_prm_teacher_log_probs(prm_teacher_log_probs)
 
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
