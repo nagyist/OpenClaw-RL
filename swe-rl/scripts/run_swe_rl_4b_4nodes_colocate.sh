@@ -78,7 +78,11 @@ if [[ -f "${SWE_RL_DIR}/../.env" ]]; then
 fi
 
 # ---- Remote Docker (SWE env pool) ----
-export SWE_EXEC_SERVER_URLS=${SWE_EXEC_SERVER_URLS:-http://192.168.26.236:5000,http://192.168.19.81:5000,http://192.168.16.56:5000,http://192.168.16.57:5000,http://192.168.16.58:5000,http://192.168.16.59:5000}
+export SWE_EXEC_SERVER_URLS=${SWE_EXEC_SERVER_URLS:-}
+if [[ -z "${SWE_EXEC_SERVER_URLS}" ]]; then
+  echo "SWE_EXEC_SERVER_URLS is required, e.g. http://<exec-1>:5000,http://<exec-2>:5000"
+  exit 1
+fi
 export SWE_MAX_CONTAINERS_PER_NODE=${SWE_MAX_CONTAINERS_PER_NODE:-48}
 _n_exec_nodes=$(echo "${SWE_EXEC_SERVER_URLS}" | tr ',' '\n' | wc -l)
 export SWE_MAX_CONCURRENT=${SWE_MAX_CONCURRENT:-$(( SWE_MAX_CONTAINERS_PER_NODE * _n_exec_nodes ))}
@@ -92,15 +96,15 @@ SWE_ENV_SERVER_PORT=${SWE_ENV_SERVER_PORT:-18090}
 SWE_ENV_SERVER_URL=${SWE_ENV_SERVER_URL:-"http://${MASTER_ADDR}:${SWE_ENV_SERVER_PORT}"}
 export SWE_ENV_SERVER_URL
 CES_SSH_USER=${CES_SSH_USER:-root}
-CES_SSH_KEY=${CES_SSH_KEY:-/data_storage/wyj/jxl/OpenClaw-RL/swe.pem}
+CES_SSH_KEY=${CES_SSH_KEY:-}
 
 ALL_EXEC_HOSTS="$(echo "${SWE_EXEC_SERVER_URLS}" | tr ',' '\n' | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
 export NO_PROXY="localhost,127.0.0.1,${MASTER_ADDR},${NODE_IP},${ALL_EXEC_HOSTS}"
 export no_proxy="${NO_PROXY}"
 
 # Proxy for external access (grading calls make_test_spec -> git clone github.com)
-export HTTP_PROXY=${HTTP_PROXY:-http://100.68.168.184:3128}
-export HTTPS_PROXY=${HTTPS_PROXY:-http://100.68.168.184:3128}
+export HTTP_PROXY=${HTTP_PROXY:-}
+export HTTPS_PROXY=${HTTPS_PROXY:-}
 export http_proxy="${HTTP_PROXY}"
 export https_proxy="${HTTPS_PROXY}"
 
@@ -171,7 +175,11 @@ if [[ ${MLP_ROLE_INDEX} -eq 0 ]]; then
 fi
 
 # ---- Checkpoint ----
-HF_CKPT=${HF_CKPT:-/data_storage/wyj/systems/huggingface/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554}
+HF_CKPT=${HF_CKPT:-}
+if [[ -z "${HF_CKPT}" ]]; then
+  echo "HF_CKPT is required (path to model checkpoint/snapshot)."
+  exit 1
+fi
 REF_LOAD=${REF_LOAD:-${HF_CKPT}}
 CKPT_ARGS=(
   --hf-checkpoint "${HF_CKPT}"
@@ -184,10 +192,10 @@ CKPT_ARGS=(
 # ---- Dataset ----
 DEBUG_MODE=${DEBUG_MODE:-0}
 if [[ "${DEBUG_MODE}" == "1" ]]; then
-  PROMPT_DATA=${PROMPT_DATA:-/data_storage/wyj/swe_gym_subset/train_10.jsonl}
+  PROMPT_DATA=${PROMPT_DATA:-${SWE_RL_DIR}/../data/swegym_293/train_with_eval_script.parquet}
   NUM_ROLLOUT=80
 else
-  PROMPT_DATA=${PROMPT_DATA:-/data_storage/wyj/jxl/OpenClaw-RL/data/swegym_293/train_with_eval_script.parquet}
+  PROMPT_DATA=${PROMPT_DATA:-${SWE_RL_DIR}/../data/swegym_293/train_with_eval_script.parquet}
   NUM_ROLLOUT=500
 fi
 if [[ ! -f "${PROMPT_DATA}" ]]; then
@@ -347,7 +355,7 @@ RUNTIME_ENV_JSON="{
     \"https_proxy\": \"${https_proxy}\",
     \"NO_PROXY\": \"${NO_PROXY}\",
     \"no_proxy\": \"${no_proxy}\",
-    \"HF_HOME\": \"${HF_HOME:-/data_storage/wyj/systems/huggingface}\",
+    \"HF_HOME\": \"${HF_HOME:-${HOME}/.cache/huggingface}\",
     \"WANDB_API_KEY\": \"${WANDB_API_KEY:-}\"
   }
 }"

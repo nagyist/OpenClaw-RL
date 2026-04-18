@@ -8,8 +8,9 @@
 #   * generate_with_swe.{generate,reward_func} (same code as training)
 #
 # Usage (head node, MLP_ROLE_INDEX=0; worker nodes set MLP_ROLE_INDEX=1..3):
-#   HF_CKPT=/data_storage/wyj/jxl/OpenClaw-RL/export/hf/swe-rl-4b_iter180 \
-#     bash swe-rl/scripts/eval_4b_4nodes.sh
+#   export SWE_EXEC_SERVER_URLS=http://<exec-1>:5000,http://<exec-2>:5000
+#   export HF_CKPT=<REPO_ROOT>/export/hf/swe-rl-4b_iter180
+#   bash swe-rl/scripts/eval_4b_4nodes.sh
 
 pkill -9 sglang || true
 sleep 3
@@ -66,9 +67,11 @@ if [[ -f "${SWE_RL_DIR}/../.env" ]]; then
 fi
 
 # ---- Remote Docker (SWE env pool) ----
-# Only server-1/2 have the swebench_verified images; servers 3-6 hold only
-# swegym_293. Use the 2 image-complete nodes for eval so both datasets work.
-export SWE_EXEC_SERVER_URLS=${SWE_EXEC_SERVER_URLS:-http://192.168.26.236:5000,http://192.168.19.81:5000}
+export SWE_EXEC_SERVER_URLS=${SWE_EXEC_SERVER_URLS:-}
+if [[ -z "${SWE_EXEC_SERVER_URLS}" ]]; then
+  echo "SWE_EXEC_SERVER_URLS is required, e.g. http://<exec-1>:5000,http://<exec-2>:5000"
+  exit 1
+fi
 export SWE_MAX_CONTAINERS_PER_NODE=${SWE_MAX_CONTAINERS_PER_NODE:-48}
 _n_exec_nodes=$(echo "${SWE_EXEC_SERVER_URLS}" | tr ',' '\n' | wc -l)
 export SWE_MAX_CONCURRENT=${SWE_MAX_CONCURRENT:-$(( SWE_MAX_CONTAINERS_PER_NODE * _n_exec_nodes ))}
@@ -82,19 +85,19 @@ SWE_ENV_SERVER_PORT=${SWE_ENV_SERVER_PORT:-18090}
 SWE_ENV_SERVER_URL=${SWE_ENV_SERVER_URL:-"http://${MASTER_ADDR}:${SWE_ENV_SERVER_PORT}"}
 export SWE_ENV_SERVER_URL
 CES_SSH_USER=${CES_SSH_USER:-root}
-CES_SSH_KEY=${CES_SSH_KEY:-/data_storage/wyj/jxl/OpenClaw-RL/swe.pem}
+CES_SSH_KEY=${CES_SSH_KEY:-}
 
 ALL_EXEC_HOSTS="$(echo "${SWE_EXEC_SERVER_URLS}" | tr ',' '\n' | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
 export NO_PROXY="localhost,127.0.0.1,${MASTER_ADDR},${NODE_IP},${ALL_EXEC_HOSTS}"
 export no_proxy="${NO_PROXY}"
 RAY_NO_PROXY="${NO_PROXY}"
 
-export HTTP_PROXY=${HTTP_PROXY:-http://100.68.168.184:3128}
-export HTTPS_PROXY=${HTTPS_PROXY:-http://100.68.168.184:3128}
+export HTTP_PROXY=${HTTP_PROXY:-}
+export HTTPS_PROXY=${HTTPS_PROXY:-}
 export http_proxy="${HTTP_PROXY}"
 export https_proxy="${HTTPS_PROXY}"
 
-SWE_DOCKER_REGISTRY=${SWE_DOCKER_REGISTRY:-slime-agent-cn-beijing.cr.volces.com}
+SWE_DOCKER_REGISTRY=${SWE_DOCKER_REGISTRY:-docker.io}
 SWE_ROLLOUT_TIMEOUT=${SWE_ROLLOUT_TIMEOUT:-1800}
 SWE_EVAL_TIMEOUT=${SWE_EVAL_TIMEOUT:-300}
 
@@ -105,8 +108,8 @@ if [[ ! -d "${HF_CKPT}" ]]; then
 fi
 
 # ---- Datasets ----
-VERIFIED_DATA=${VERIFIED_DATA:-/data_storage/wyj/jxl/OpenClaw-RL/data/swebench_verified/verified_eval_with_script.jsonl}
-SWEGYM_DATA=${SWEGYM_DATA:-/data_storage/wyj/jxl/OpenClaw-RL/data/swegym_293/train_with_eval_script.parquet}
+VERIFIED_DATA=${VERIFIED_DATA:-${SWE_RL_DIR}/../data/swebench_verified/verified_eval_with_script.jsonl}
+SWEGYM_DATA=${SWEGYM_DATA:-${SWE_RL_DIR}/../data/swegym_293/train_with_eval_script.parquet}
 
 # Batch size: saturate ECS concurrency, but keep moderate so repeated samples
 # in the remainder are bounded.
@@ -124,7 +127,11 @@ _cleanup_ecs_containers() {
   for url in "${_urls[@]}"; do
     host="$(echo "${url}" | sed -E 's#https?://([^:/]+).*#\1#')"
     echo "Cleaning Docker on ${host}..."
-    ssh -i "${CES_SSH_KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+    ssh_key_args=()
+    if [[ -n "${CES_SSH_KEY}" ]]; then
+      ssh_key_args=(-i "${CES_SSH_KEY}")
+    fi
+    ssh "${ssh_key_args[@]}" -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
       "${CES_SSH_USER}@${host}" 'docker ps -aq --filter "name=swe-" | xargs -r docker rm -f' 2>/dev/null || true
   done
 }
@@ -182,7 +189,7 @@ _build_runtime_env() {
     \"https_proxy\": \"${https_proxy}\",
     \"NO_PROXY\": \"${NO_PROXY}\",
     \"no_proxy\": \"${no_proxy}\",
-    \"HF_HOME\": \"${HF_HOME:-/data_storage/wyj/systems/huggingface}\"
+    \"HF_HOME\": \"${HF_HOME:-${HOME}/.cache/huggingface}\"
   }
 }"
 }
