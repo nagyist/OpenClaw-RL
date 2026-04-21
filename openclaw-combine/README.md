@@ -44,6 +44,8 @@ cd slime
 bash ../openclaw-combine/run_qwen3_4b_openclaw_combine.sh
 ```
 
+
+
 ### Key Environment Variables
 
 | Variable | Default | Description |
@@ -53,6 +55,17 @@ bash ../openclaw-combine/run_qwen3_4b_openclaw_combine.sh
 | `PRM_M` | `1` | Number of independent judge/eval votes per turn |
 
 All other variables (`NUM_GPUS`, `ACTOR_GPUS`, `HF_CKPT`, etc.) are shared with the Binary RL and OPD scripts — see the [main README](../README.md) for the full list.
+
+To use qwen3.5, you need to convert to torch list first
+
+```
+# or for qwen3.5:
+source scripts/models/qwen3-4B.sh
+PYTHONPATH=/path/to/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+    ${MODEL_ARGS[@]} \
+    --hf-checkpoint /path/to/qwen3.5-4b \
+    --save /path/to/qwen3.5-4b-torch_dist
+```
 
 ## File Structure
 
