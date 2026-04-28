@@ -1382,6 +1382,38 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Number of independent PRM calls per step; the step score is the mean.",
             )
             parser.add_argument(
+                "--hint-m",
+                type=int,
+                default=None,
+                help=(
+                    "Number of PRM hint-generation rollouts per step. When unset "
+                    "(default), falls back to --prm-m. Only consumed by the "
+                    "retool-hybrid-select generate path (toolcall-rl/"
+                    "generate_with_retool_hybrid_select.py); ignored by the "
+                    "scalar-OPD / topk-OPD baselines."
+                ),
+            )
+            parser.add_argument(
+                "--hint-selection",
+                type=str,
+                choices=["shortest", "token_optimal", "sequence_optimal"],
+                default="shortest",
+                help=(
+                    "How to reduce per-step hint candidates and per-sample "
+                    "teacher-supervision candidates in the retool-hybrid-select "
+                    "loss path. 'shortest' (legacy): pick the shortest accepted "
+                    "hint per step, run a single teacher forward. "
+                    "'token_optimal': for every response token pick the teacher "
+                    "candidate whose top-K most overlaps the student's top-K. "
+                    "'sequence_optimal': pick a single teacher candidate per "
+                    "sample with maximal sum-over-positions overlap. The latter "
+                    "two require K teacher forwards on hint-enhanced prompts; "
+                    "they only make sense with --distill-subset-mode overlap "
+                    "(or teacher) since 'student' mode pre-aligns teacher "
+                    "indices to the student's so all candidates are degenerate."
+                ),
+            )
+            parser.add_argument(
                 "--prm-router-ip",
                 type=str,
                 default=None,
