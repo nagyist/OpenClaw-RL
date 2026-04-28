@@ -35,6 +35,7 @@ from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_da
 from .initialize import init, is_megatron_main_rank
 from .loss import (
     compute_advantages_and_returns,
+    emit_native_topk_indices,
     emit_topk_logprobs,
     gather_log_probs_at_indices,
     get_log_probs_and_entropy,
@@ -412,6 +413,12 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data["teacher_tokens"] = [
                 torch.tensor(t, dtype=torch.long) for t in rollout_data["teacher_tokens"]
             ]
+        if "teacher_tokens_candidates" in rollout_data:
+            # Per sample: list[K_i] of token-id sequences -> list[K_i] of LongTensor.
+            rollout_data["teacher_tokens_candidates"] = [
+                [torch.tensor(t, dtype=torch.long) for t in cand_list]
+                for cand_list in rollout_data["teacher_tokens_candidates"]
+            ]
         rollout_data["loss_masks"] = [
             torch.tensor(t, dtype=torch.int) for t in rollout_data["loss_masks"]
         ]
@@ -625,11 +632,31 @@ class MegatronTrainRayActor(TrainRayActor):
     def compute_prm_teacher_log_probs(self, rollout_id: int, rollout_data: RolloutBatch):
         """Compute log-probs on the dedicated PRM teacher GPU using hint-enhanced tokens.
 
-        Returns a dict ``{key_with_prm_teacher_prefix: list[Tensor]}`` so that
-        any extra outputs produced by ``get_log_probs_and_entropy`` (e.g. the
-        per-position top-K log-probs / indices when ``--distill-topk > 0``)
-        also travel back to the actor.
+        Two paths share this entry point:
+
+        * Single-candidate (legacy): ``rollout_data["teacher_tokens"]`` holds
+          one hint-enhanced token sequence per sample. We do ONE teacher
+          forward and emit per-sample tensors keyed
+          ``prm_teacher_log_probs / prm_teacher_topk_log_probs /
+          prm_teacher_topk_indices`` (each ``[R_i, ...]``).
+
+        * Multi-candidate (retool-hybrid-select, K hints per sample):
+          ``rollout_data["teacher_tokens_candidates"]`` holds ``K_i`` token
+          sequences per sample (variable across samples; cyclic-padded to
+          ``K_max = max_i K_i`` for the K-loop below).  We do ``K_max``
+          teacher forwards in series, swapping the "tokens" / "total_lengths"
+          fields each iteration.  Outputs are stacked along a new leading
+          ``K`` axis and emitted as ``*_cand`` keys (per sample
+          ``[K_max, R_i, ...]`` tensors).  ``prm_teacher_K_per_sample`` /
+          ``prm_teacher_K_max`` travel alongside so the loss can mask cyclic
+          duplicates if it wants to.
         """
+        teacher_tokens_cand = rollout_data.get("teacher_tokens_candidates")
+        if teacher_tokens_cand is not None and len(teacher_tokens_cand) > 0:
+            return self._compute_prm_teacher_log_probs_multi_cand(
+                rollout_id, rollout_data, teacher_tokens_cand
+            )
+
         teacher_tokens = rollout_data.get("teacher_tokens")
         if teacher_tokens is not None:
             rollout_data["tokens"] = teacher_tokens
@@ -647,6 +674,129 @@ class MegatronTrainRayActor(TrainRayActor):
                 out[key] = [v.cpu() if isinstance(v, torch.Tensor) else v for v in val]
             else:
                 out[key] = val
+        return out
+
+    def _compute_prm_teacher_log_probs_multi_cand(
+        self,
+        rollout_id: int,
+        rollout_data: RolloutBatch,
+        teacher_tokens_cand: list[list[torch.Tensor]],
+    ) -> dict[str, list]:
+        """K-loop teacher forward for the retool-hybrid-select path.
+
+        ``teacher_tokens_cand[i]`` is a non-empty list of ``K_i`` LongTensors
+        (each is one hint-enhanced token sequence for sample ``i``).
+        ``K_per_sample[i] = K_i``, and ``K_max = max_i K_i``.  Sample ``i``
+        with ``K_i < K_max`` cyclically reuses its own candidates so every
+        forward sees a full batch.
+
+        For each ``k in [0, K_max)`` we override
+        ``rollout_data["tokens"]`` and ``rollout_data["total_lengths"]`` with
+        the ``k``-th candidate per sample, build a fresh data iterator (so
+        dynamic-batch packing is honored for THIS candidate's lengths) and
+        run the existing teacher forward under ``emit_topk_logprobs()``.
+
+        Outputs from each forward are per-sample lists of CPU tensors; we
+        stack them along a new leading K axis (so each per-sample tensor is
+        ``[K_max, R_i, ...]``) and ship them under the ``*_cand`` keys.
+        ``R_i`` is invariant across candidates (the response is the same;
+        only the prompt prefix changes).
+        """
+        n_samples = len(teacher_tokens_cand)
+        K_per_sample = [len(c) for c in teacher_tokens_cand]
+        if min(K_per_sample) <= 0:
+            raise RuntimeError(
+                "_compute_prm_teacher_log_probs_multi_cand: every sample must "
+                "carry at least one candidate teacher_tokens entry. Got "
+                f"K_per_sample={K_per_sample}. The generate path is supposed "
+                "to fall back to the un-enhanced prompt for samples with no "
+                "accepted hints (single-candidate of length=1)."
+            )
+        K_max = max(K_per_sample)
+
+        orig_tokens = rollout_data.get("tokens")
+        orig_total = rollout_data.get("total_lengths")
+        orig_max_seq_lens = rollout_data.get("max_seq_lens")
+
+        # bshd needs a uniform max_seq_lens computed from the GLOBAL maximum
+        # over all candidates (otherwise a later candidate could exceed the
+        # max_seq_lens fixed for the first one).
+        if self.args.qkv_format == "bshd":
+            cand_max = 0
+            for cand_list in teacher_tokens_cand:
+                for t in cand_list:
+                    cand_max = max(cand_max, t.size(0))
+            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+            cand_max = (cand_max + pad_size - 1) // pad_size * pad_size
+
+        per_cand_results: list[dict] = []
+        for k in range(K_max):
+            tokens_k: list[torch.Tensor] = []
+            total_lengths_k: list[int] = []
+            for i, cand_list in enumerate(teacher_tokens_cand):
+                idx = k % K_per_sample[i]
+                tk = cand_list[idx]
+                tokens_k.append(tk)
+                total_lengths_k.append(int(tk.size(0)))
+            rollout_data["tokens"] = tokens_k
+            rollout_data["total_lengths"] = total_lengths_k
+            if self.args.qkv_format == "bshd":
+                rollout_data["max_seq_lens"] = [cand_max] * n_samples
+
+            data_iterator, num_microbatches = get_data_iterator(
+                self.args, self.model, rollout_data
+            )
+            with emit_topk_logprobs():
+                result_k = self.compute_log_prob(
+                    data_iterator, num_microbatches, store_prefix="prm_teacher_"
+                )
+            cpu_result_k: dict[str, list] = {}
+            for key, val in result_k.items():
+                if isinstance(val, list):
+                    cpu_result_k[key] = [
+                        v.cpu() if isinstance(v, torch.Tensor) else v for v in val
+                    ]
+                else:
+                    cpu_result_k[key] = val
+            per_cand_results.append(cpu_result_k)
+
+        # Restore originals (defensive — train_actor still re-uses
+        # rollout_data after the payload merge).
+        if orig_tokens is not None:
+            rollout_data["tokens"] = orig_tokens
+        if orig_total is not None:
+            rollout_data["total_lengths"] = orig_total
+        if orig_max_seq_lens is not None:
+            rollout_data["max_seq_lens"] = orig_max_seq_lens
+
+        out: dict[str, list] = {}
+        # Stack per-sample tensors along a new K axis. We expect the standard
+        # three keys produced by the prm_teacher forward:
+        #   prm_teacher_log_probs        per sample [R_i]
+        #   prm_teacher_topk_log_probs   per sample [R_i, K_topk]
+        #   prm_teacher_topk_indices     per sample [R_i, K_topk]
+        # Stacked: each per-sample tensor becomes [K_max, R_i, ...].
+        for key in (
+            "prm_teacher_log_probs",
+            "prm_teacher_topk_log_probs",
+            "prm_teacher_topk_indices",
+        ):
+            if key not in per_cand_results[0]:
+                continue
+            stacked_per_sample: list[torch.Tensor] = []
+            for i in range(n_samples):
+                per_k_tensors = []
+                for k in range(K_max):
+                    val = per_cand_results[k][key][i]
+                    if not isinstance(val, torch.Tensor):
+                        val = torch.as_tensor(val)
+                    per_k_tensors.append(val)
+                stacked_per_sample.append(torch.stack(per_k_tensors, dim=0))
+            out[key + "_cand"] = stacked_per_sample
+        # K_per_sample / K_max are derivable from the stacked tensors above
+        # (K_max from .size(0); K_per_sample only matters if you want to
+        # mask the cyclic-padded duplicates, which is equivalent for both
+        # token_optimal and sequence_optimal selection so we skip it).
         return out
 
     def compute_student_topk(self, rollout_id: int, rollout_data_ref: Box):
@@ -679,6 +829,103 @@ class MegatronTrainRayActor(TrainRayActor):
             iterator.reset()
         return {"topk_indices": out_indices}
 
+    @staticmethod
+    def _select_teacher_cand_per_sample(
+        student_topk_idx: list[torch.Tensor],
+        teacher_idx_cand: list[torch.Tensor],
+        teacher_lp_cand: list[torch.Tensor] | None,
+        *,
+        hint_selection: str,
+        step_spans_per_sample: list[list[list[int]]] | None,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Pick one candidate per token / per step / per sample by overlap.
+
+        For each sample i:
+          * student_topk_idx[i]: [R_i, K_q]
+          * teacher_idx_cand[i]: [K_max, R_i, K_p]
+          * teacher_lp_cand[i]:  [K_max, R_i, K_p]
+        Returns per-sample ``(sel_idx [R_i, K_p], sel_lp [R_i, K_p])``
+        sliced along the chosen ``k*(t)``.
+
+        Selection mirrors the loss kernel exactly so the loss-side
+        ``S_t = S^p_{t,k*}`` and the actor-side re-gather agree:
+
+        * ``token_optimal``    : k*(t) = argmax_k O[k, t]
+        * ``sequence_optimal`` : per-step argmax_k Σ_{t in step} O[k, t]
+        * ``shortest``         : k* = 0 (single-cand semantics)
+        """
+        sel_idx_list: list[torch.Tensor] = []
+        sel_lp_list: list[torch.Tensor] = []
+        for i, t_idx_cand in enumerate(teacher_idx_cand):
+            # Tensors arrive on CPU at this point (offloaded after the
+            # student-old forward). Keep selection on CPU -- the inputs
+            # are tiny ([K, R, K_p] with K<=4, K_p<=20), so vectorised
+            # CPU is fine and avoids extra H2D bounce.
+            t_idx_cand_t = (
+                t_idx_cand if isinstance(t_idx_cand, torch.Tensor)
+                else torch.as_tensor(t_idx_cand)
+            ).long()
+            t_lp_cand_t = teacher_lp_cand[i] if teacher_lp_cand is not None else None
+            if t_lp_cand_t is not None and not isinstance(t_lp_cand_t, torch.Tensor):
+                t_lp_cand_t = torch.as_tensor(t_lp_cand_t)
+            s_idx = student_topk_idx[i]
+            if not isinstance(s_idx, torch.Tensor):
+                s_idx = torch.as_tensor(s_idx)
+            s_idx = s_idx.long().to(t_idx_cand_t.device)
+
+            K_max, R_i, K_p = t_idx_cand_t.shape
+            if hint_selection == "shortest" or K_max == 1:
+                k_star_per_token = torch.zeros(R_i, dtype=torch.long, device=t_idx_cand_t.device)
+            else:
+                # eq: [K, R, K_q, K_p]; O[k, t] = | S^q_t ∩ S^p_{t, k} |.
+                eq = s_idx.unsqueeze(0).unsqueeze(-1) == t_idx_cand_t.unsqueeze(-2)
+                O = eq.any(dim=-1).sum(dim=-1).long()  # [K, R]
+                if hint_selection == "token_optimal":
+                    k_star_per_token = O.argmax(dim=0)  # [R]
+                elif hint_selection == "sequence_optimal":
+                    spans = (
+                        step_spans_per_sample[i]
+                        if step_spans_per_sample is not None
+                        else None
+                    )
+                    if not spans:
+                        # Treat the whole sequence as one step.
+                        k_star_scalar = int(O.sum(dim=-1).argmax().item())
+                        k_star_per_token = torch.full(
+                            (R_i,), k_star_scalar,
+                            dtype=torch.long, device=t_idx_cand_t.device,
+                        )
+                    else:
+                        k_star_per_token = torch.zeros(
+                            R_i, dtype=torch.long, device=t_idx_cand_t.device
+                        )
+                        for span in spans:
+                            t0, t1 = int(span[0]), int(span[1])
+                            t0 = max(0, min(t0, R_i))
+                            t1 = max(t0, min(t1, R_i))
+                            if t1 == t0:
+                                continue
+                            seg_score = O[:, t0:t1].sum(dim=-1)  # [K]
+                            k_star_per_token[t0:t1] = int(seg_score.argmax().item())
+                else:
+                    raise ValueError(
+                        f"Unknown --hint-selection: {hint_selection!r}. "
+                        "Expected 'shortest' / 'token_optimal' / 'sequence_optimal'."
+                    )
+            gather_idx = (
+                k_star_per_token.view(1, R_i, 1).expand(1, R_i, K_p)
+            )
+            sel_idx = torch.gather(t_idx_cand_t, dim=0, index=gather_idx).squeeze(0)
+            sel_idx_list.append(sel_idx.to(torch.long))
+            if t_lp_cand_t is not None:
+                sel_lp = torch.gather(t_lp_cand_t, dim=0, index=gather_idx).squeeze(0)
+                sel_lp_list.append(sel_lp.to(torch.float32))
+        if not sel_lp_list:
+            sel_lp_list = [
+                idx.new_zeros(idx.shape, dtype=torch.float32) for idx in sel_idx_list
+            ]
+        return sel_idx_list, sel_lp_list
+
     def gather_at_indices(
         self, rollout_id: int, rollout_data_ref: Box, indices_per_sample: list
     ):
@@ -688,12 +935,33 @@ class MegatronTrainRayActor(TrainRayActor):
         a list of ``[R_i, K]`` long tensors (CPU) -- the student top-K
         indices computed earlier on the actor side.
 
-        Returns ``{"prm_teacher_topk_log_probs": [...], "prm_teacher_topk_indices": [...]}``.
+        Single-candidate (legacy): one teacher forward; emits per-sample
+        ``prm_teacher_topk_log_probs`` and ``prm_teacher_topk_indices``.
+
+        Multi-candidate (auto-detected when ``rollout_data`` carries
+        ``teacher_tokens_candidates``): K_max teacher forwards in series,
+        each gathering at the SAME student top-K (so log-prob VALUES at
+        S^q vary across k while indices are constant). ``emit_native_topk
+        _indices(K_topk)`` rides alongside so each forward also reports
+        the candidate's own native top-K indices, used by the loss as the
+        per-(k,t) selection signal under student mode. Outputs:
+
+        * ``prm_teacher_topk_log_probs_cand``     [K_max, R_i, K_topk]
+        * ``prm_teacher_topk_indices_cand``       [K_max, R_i, K_topk]
+          (constant across k; echoed for kernel symmetry with the
+          overlap/teacher modes' shape contract)
+        * ``prm_teacher_native_topk_indices_cand`` [K_max, R_i, K_topk]
+          (this candidate's native top-K, the selection signal).
         """
         if self.args.offload_train:
             self.wake_up()
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
+        teacher_tokens_cand = rollout_data.get("teacher_tokens_candidates")
+        if teacher_tokens_cand is not None and len(teacher_tokens_cand) > 0:
+            return self._gather_at_indices_multi_cand(
+                rollout_data, indices_per_sample, teacher_tokens_cand
+            )
         teacher_tokens = rollout_data.get("teacher_tokens")
         if teacher_tokens is not None:
             rollout_data["tokens"] = teacher_tokens
@@ -734,6 +1002,132 @@ class MegatronTrainRayActor(TrainRayActor):
                 out[key] = [v.cpu() if isinstance(v, torch.Tensor) else v for v in val]
             else:
                 out[key] = val
+        return out
+
+    def _gather_at_indices_multi_cand(
+        self,
+        rollout_data: RolloutBatch,
+        indices_per_sample: list,
+        teacher_tokens_cand: list[list[torch.Tensor]],
+    ) -> dict[str, list]:
+        """K-loop teacher gather-at-indices for ``--distill-subset-mode student``.
+
+        ``teacher_tokens_cand[i]`` holds K_i hint-enhanced token sequences
+        for sample i; we run K_max=max_i K_i teacher forwards and stack
+        per-sample outputs along a new leading K axis (cyclic-padded so
+        every forward sees a full batch). Each forward gathers log-probs
+        at the SAME student top-K ``indices_per_sample[i]`` (so all S^q_t
+        align across k) and ALSO emits the candidate's native top-K
+        indices via ``emit_native_topk_indices`` for downstream selection.
+        """
+        n_samples = len(teacher_tokens_cand)
+        K_per_sample = [len(c) for c in teacher_tokens_cand]
+        if min(K_per_sample) <= 0:
+            raise RuntimeError(
+                "_gather_at_indices_multi_cand: every sample must carry at "
+                f"least one candidate teacher_tokens entry. Got {K_per_sample}."
+            )
+        K_max = max(K_per_sample)
+        if len(indices_per_sample) != n_samples:
+            raise RuntimeError(
+                f"_gather_at_indices_multi_cand: indices_per_sample length "
+                f"{len(indices_per_sample)} != n_samples {n_samples}."
+            )
+        # Native-topk width matches student's distill-topk so the per-token
+        # overlap O[k, t] = | S^q_t ∩ S^p_{t,k} | is well-defined for the
+        # loss-side selection signal.
+        native_K = int(getattr(self.args, "distill_topk", 0) or 0)
+
+        orig_tokens = rollout_data.get("tokens")
+        orig_total = rollout_data.get("total_lengths")
+        orig_max_seq_lens = rollout_data.get("max_seq_lens")
+
+        if self.args.qkv_format == "bshd":
+            cand_max = 0
+            for cand_list in teacher_tokens_cand:
+                for t in cand_list:
+                    cand_max = max(cand_max, t.size(0))
+            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+            cand_max = (cand_max + pad_size - 1) // pad_size * pad_size
+
+        per_cand_results: list[dict] = []
+        for k in range(K_max):
+            tokens_k: list[torch.Tensor] = []
+            total_lengths_k: list[int] = []
+            for i, cand_list in enumerate(teacher_tokens_cand):
+                idx = k % K_per_sample[i]
+                tk = cand_list[idx]
+                tokens_k.append(tk)
+                total_lengths_k.append(int(tk.size(0)))
+            rollout_data["tokens"] = tokens_k
+            rollout_data["total_lengths"] = total_lengths_k
+            if self.args.qkv_format == "bshd":
+                rollout_data["max_seq_lens"] = [cand_max] * n_samples
+
+            data_iterator, num_microbatches = get_data_iterator(
+                self.args, self.model, rollout_data
+            )
+            teacher_mb_indices = getattr(data_iterator[0], "micro_batch_indices", None)
+            if teacher_mb_indices is not None:
+                flat_indices: list[int] = sum(teacher_mb_indices, [])
+                if len(flat_indices) != n_samples:
+                    raise RuntimeError(
+                        f"_gather_at_indices_multi_cand: consumption order "
+                        f"length {len(flat_indices)} != n_samples {n_samples}."
+                    )
+                payload = [indices_per_sample[i] for i in flat_indices]
+            else:
+                payload = list(indices_per_sample)
+            with timer("prm_teacher_gather_at_indices_log_probs_multi_cand"):
+                with set_gather_at_indices(payload), emit_native_topk_indices(native_K):
+                    result_k = forward_only(
+                        gather_log_probs_at_indices,
+                        self.args,
+                        self.model,
+                        data_iterator,
+                        num_microbatches,
+                        store_prefix="prm_teacher_",
+                    )
+            cpu_result_k: dict[str, list] = {}
+            for key, val in result_k.items():
+                if isinstance(val, list):
+                    cpu_result_k[key] = [
+                        v.cpu() if isinstance(v, torch.Tensor) else v for v in val
+                    ]
+                else:
+                    cpu_result_k[key] = val
+            per_cand_results.append(cpu_result_k)
+
+        if orig_tokens is not None:
+            rollout_data["tokens"] = orig_tokens
+        if orig_total is not None:
+            rollout_data["total_lengths"] = orig_total
+        if orig_max_seq_lens is not None:
+            rollout_data["max_seq_lens"] = orig_max_seq_lens
+
+        out: dict[str, list] = {}
+        # forward_only prepends ``store_prefix`` to every result-dict key
+        # (so e.g. "topk_log_probs" -> "prm_teacher_topk_log_probs"); we
+        # then re-suffix with "_cand" so the loss kernel's shape contract
+        # for the multi-candidate path is honoured.
+        key_map = {
+            "prm_teacher_topk_log_probs": "prm_teacher_topk_log_probs_cand",
+            "prm_teacher_topk_indices": "prm_teacher_topk_indices_cand",
+            "prm_teacher_topk_native_indices": "prm_teacher_native_topk_indices_cand",
+        }
+        for src_key, dst_key in key_map.items():
+            if src_key not in per_cand_results[0]:
+                continue
+            stacked_per_sample: list[torch.Tensor] = []
+            for i in range(n_samples):
+                per_k_tensors = []
+                for k in range(K_max):
+                    val = per_cand_results[k][src_key][i]
+                    if not isinstance(val, torch.Tensor):
+                        val = torch.as_tensor(val)
+                    per_k_tensors.append(val)
+                stacked_per_sample.append(torch.stack(per_k_tensors, dim=0))
+            out[dst_key] = stacked_per_sample
         return out
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
@@ -834,18 +1228,82 @@ class MegatronTrainRayActor(TrainRayActor):
 
                     # Mode `teacher`: do an extra old_actor forward that
                     # gathers student-old log-probs at the TEACHER's top-K
-                    # indices (already shipped via _prm_teacher_log_probs
-                    # → rollout_data["prm_teacher_topk_indices"]). REPLACE
-                    # the student-side topk_log_probs / topk_indices so the
-                    # loss sees S^q == S^p == teacher top-K (mask all-True).
+                    # indices. Two payload shapes are handled:
+                    #
+                    # * Single-candidate (legacy): the teacher pass emitted
+                    #   per-sample [R_i, K_p] tensors under
+                    #   ``prm_teacher_topk_indices`` -- use them directly.
+                    #
+                    # * Multi-candidate (--hint-m > 0 + select path): the
+                    #   teacher pass emitted per-sample [K_max, R_i, K_p]
+                    #   tensors under ``prm_teacher_topk_indices_cand``.
+                    #   We need to pick which candidate's top-K becomes
+                    #   the loss subset. Emulate the loss-side selection:
+                    #   compute the per-(k, t) overlap with the student's
+                    #   own top-K (``topk_indices`` from this same forward)
+                    #   and pick k*(t) per token / per step (or globally
+                    #   per sample) according to ``--hint-selection``.
+                    #   Slice the cand teacher tensors to single-cand
+                    #   along k* so the loss kernel sees the same shape
+                    #   contract as the legacy teacher path.
                     if distill_topk > 0 and subset_mode == "teacher":
-                        teacher_idx = rollout_data.get("prm_teacher_topk_indices")
-                        if teacher_idx is None or len(teacher_idx) == 0:
-                            raise RuntimeError(
-                                "subset_mode=teacher requires prm_teacher_topk_indices "
-                                "in rollout_data. Did the prm_teacher pass run with "
-                                "--distill-topk > 0?"
+                        teacher_idx_cand = rollout_data.get(
+                            "prm_teacher_topk_indices_cand"
+                        )
+                        teacher_lp_cand = rollout_data.get(
+                            "prm_teacher_topk_log_probs_cand"
+                        )
+                        if teacher_idx_cand is not None and len(teacher_idx_cand) > 0:
+                            student_topk_idx = rollout_data.get("topk_indices")
+                            if student_topk_idx is None or len(student_topk_idx) == 0:
+                                raise RuntimeError(
+                                    "subset_mode=teacher with multi-candidate "
+                                    "teacher tensors requires the student top-K "
+                                    "(topk_indices) from the old_actor forward. "
+                                    "Confirm --distill-topk > 0."
+                                )
+                            hint_selection = getattr(
+                                self.args, "hint_selection", "shortest"
                             )
+                            step_spans_per_sample = rollout_data.get(
+                                "step_wise_step_token_spans"
+                            )
+                            sel_idx_per_sample, sel_lp_per_sample = (
+                                self._select_teacher_cand_per_sample(
+                                    student_topk_idx,
+                                    teacher_idx_cand,
+                                    teacher_lp_cand,
+                                    hint_selection=hint_selection,
+                                    step_spans_per_sample=step_spans_per_sample,
+                                )
+                            )
+                            # The re-gather payload below is consumed in
+                            # the teacher's microbatch order; pass the
+                            # original-order list, gather_at_indices
+                            # below uses set_gather_at_indices with the
+                            # train-side data_iterator's ordering (same
+                            # as the just-finished forward).
+                            teacher_idx = sel_idx_per_sample
+                            # Replace cand keys with selected single-cand
+                            # tensors so the loss kernel reads the same
+                            # shape contract as the legacy teacher path.
+                            rollout_data["prm_teacher_topk_indices"] = (
+                                sel_idx_per_sample
+                            )
+                            rollout_data["prm_teacher_topk_log_probs"] = (
+                                sel_lp_per_sample
+                            )
+                        else:
+                            teacher_idx = rollout_data.get(
+                                "prm_teacher_topk_indices"
+                            )
+                            if teacher_idx is None or len(teacher_idx) == 0:
+                                raise RuntimeError(
+                                    "subset_mode=teacher requires prm_teacher_topk_indices "
+                                    "(or prm_teacher_topk_indices_cand under multi-cand) "
+                                    "in rollout_data. Did the prm_teacher pass run with "
+                                    "--distill-topk > 0?"
+                                )
                         # Reset iterator: forward_only consumed it once.
                         for it in data_iterator:
                             it.reset()

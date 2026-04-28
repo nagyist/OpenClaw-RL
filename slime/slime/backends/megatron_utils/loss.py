@@ -314,6 +314,44 @@ def _vocab_parallel_topk_log_probs(
 _GATHER_AT_INDICES_PAYLOAD: list[torch.Tensor] | None = None
 _GATHER_AT_INDICES_CURSOR: int = 0
 
+# When >0, gather_log_probs_at_indices ALSO computes the teacher's native
+# top-K indices on the same logits chunk (no extra forward pass) and
+# returns them under "topk_native_indices". This lets the multi-candidate
+# student-mode K-loop carry the candidate's own top-K to the loss as a
+# selection signal alongside the gathered log-probs at the student's S^q.
+# Default 0 leaves the existing single-candidate path byte-identical.
+_EMIT_NATIVE_TOPK_K: int = 0
+
+
+class emit_native_topk_indices:
+    """Context manager: ALSO emit teacher's native top-K indices in the
+    gather-at-indices forward.
+
+    Args:
+        K: native top-K width to compute on each logits chunk; if ``K<=0``
+           the augmentation is disabled.
+
+    Used by the multi-candidate path in ``--distill-subset-mode student``:
+    the teacher's log-probs are gathered at the student's top-K (so values
+    at S^q are valid for the loss), and the candidate's own native top-K
+    indices ride alongside as a side channel for the per-token / per-step
+    overlap selection in the loss.
+    """
+
+    def __init__(self, K: int):
+        self._K = int(K)
+
+    def __enter__(self):
+        global _EMIT_NATIVE_TOPK_K
+        self._prev = _EMIT_NATIVE_TOPK_K
+        _EMIT_NATIVE_TOPK_K = max(0, self._K)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _EMIT_NATIVE_TOPK_K
+        _EMIT_NATIVE_TOPK_K = self._prev
+        return False
+
 
 class set_gather_at_indices:
     """Context manager: provide a list[Tensor] of GLOBAL vocab ids per sample.
@@ -402,6 +440,12 @@ def gather_log_probs_at_indices(
     * ``topk_log_probs``: list of ``[R_i, K]`` fp32 log-probs per sample.
     * ``topk_indices``:   list of ``[R_i, K]`` long indices per sample
       (echoed from the payload for downstream consumers).
+
+    When ``emit_native_topk_indices(K)`` is active, additionally returns:
+
+    * ``topk_native_indices``: list of ``[R_i, K]`` long indices per sample
+      holding the model's *own* global top-K indices on the same logits
+      chunk. Computed in the same forward (no extra pass).
     """
     assert non_loss_data
     global _GATHER_AT_INDICES_PAYLOAD, _GATHER_AT_INDICES_CURSOR
@@ -411,8 +455,10 @@ def gather_log_probs_at_indices(
             "gather_log_probs_at_indices called outside set_gather_at_indices() context."
         )
     tp_group = mpu.get_tensor_model_parallel_group()
+    native_K = int(_EMIT_NATIVE_TOPK_K)
     log_probs_list: list[torch.Tensor] = []
     indices_list: list[torch.Tensor] = []
+    native_indices_list: list[torch.Tensor] = []
     for logits_chunk, _tokens_chunk in get_responses(
         logits,
         args=args,
@@ -439,10 +485,18 @@ def gather_log_probs_at_indices(
         lp = _vocab_parallel_log_probs_at_indices(logits_chunk, idx, tp_group)
         log_probs_list.append(lp)
         indices_list.append(idx)
-    return torch.empty((0,), device=logits.device), {
+        if native_K > 0:
+            _, native_idx = _vocab_parallel_topk_log_probs(
+                logits_chunk, native_K, tp_group
+            )
+            native_indices_list.append(native_idx)
+    out = {
         "topk_log_probs": log_probs_list,
         "topk_indices": indices_list,
     }
+    if native_K > 0:
+        out["topk_native_indices"] = native_indices_list
+    return torch.empty((0,), device=logits.device), out
 
 
 def get_values(
